@@ -4,16 +4,23 @@ A self-contained Debian 12 (bookworm) bundle for running Lean 4, Mathlib, the Le
 
 ## What's Inside
 
-| Component | Location in bundle | Purpose |
+The bundle is split into two tarballs (each under GitHub's 2 GB asset limit):
+
+### Part 1 — `lean-mathlib-bookworm-*-part1.tar.xz`
+
+| Component | Location | Purpose |
 |---|---|---|
 | Debian `.deb` packages | `debs/` | Offline system dependencies (git, curl, build-essential, libgmp-dev, python3-venv, etc.) |
-| Python wheels | `wheels/` | Offline wheels for `lean-interact`, `leanclient`, `pip`, `setuptools`, `wheel` |
-| Elan + Lean toolchain | `elan/` | Pinned Lean 4 toolchain managed by Elan |
-| Mathlib `.olean` cache | `mathlib-cache/` | Precompiled Mathlib artifacts (`XDG_CACHE_HOME`) |
-| Lake workspace | `workspace/` | Prebuilt workspace with Mathlib + REPL sources and `.olean`s |
+| Elan + Lean toolchain | `elan/` | Pinned Lean 4 toolchain managed by Elan (docs/tests/src stripped) |
 | Installer | `install.sh` | Offline installation script |
+| Documentation | `lean.md` | This file |
 
-A smaller helper tarball (`lean-python-repl-bookworm-*.tar.xz`) is also produced containing just `wheels/` and the prebuilt `repl` package.
+### Part 2 — `lean-mathlib-bookworm-*-part2.tar.xz`
+
+| Component | Location | Purpose |
+|---|---|---|
+| Lake workspace | `workspace/` | Prebuilt workspace with Mathlib + REPL sources and `.olean`s |
+| Python wheels | `wheels/` | Offline wheels for `lean-interact`, `leanclient`, `pip`, `setuptools`, `wheel` |
 
 ## Prerequisites (Target Machine)
 
@@ -24,23 +31,24 @@ A smaller helper tarball (`lean-python-repl-bookworm-*.tar.xz`) is also produced
 
 ## Installation
 
-1. **Transfer the bundle** to the airgapped target machine:
+1. **Transfer both parts** to the airgapped target machine:
 
    ```sh
-   scp lean-mathlib-bookworm-v4.31.0.tar.xz user@target:/tmp/
+   scp lean-mathlib-bookworm-*-part1.tar.xz lean-mathlib-bookworm-*-part2.tar.xz user@target:/tmp/
    ```
 
-2. **Extract the bundle:**
+2. **Extract both parts into the same directory:**
 
    ```sh
-   cd /tmp
-   tar -xf lean-mathlib-bookworm-v4.31.0.tar.xz
-   cd lean-mathlib-bookworm-v4.31.0
+   mkdir -p /tmp/lean-bundle
+   tar -xf /tmp/lean-mathlib-bookworm-*-part1.tar.xz -C /tmp/lean-bundle
+   tar -xf /tmp/lean-mathlib-bookworm-*-part2.tar.xz -C /tmp/lean-bundle
    ```
 
 3. **Run the installer** (as root for `.deb` installation):
 
    ```sh
+   cd /tmp/lean-bundle
    sudo ./install.sh /opt/lean
    ```
 
@@ -48,7 +56,7 @@ A smaller helper tarball (`lean-python-repl-bookworm-*.tar.xz`) is also produced
 
    The installer will:
    - Install offline `.deb` packages via `dpkg -i`
-   - Copy `elan/`, `mathlib-cache/`, and `workspace/` to the target prefix
+   - Copy `elan/` and `workspace/` to the target prefix
    - Create a Python venv and install `lean-interact` + `leanclient` offline
    - Generate an `env.sh` activation script
 
@@ -65,7 +73,6 @@ This sets:
 | Variable | Value |
 |---|---|
 | `ELAN_HOME` | `/opt/lean/elan` |
-| `XDG_CACHE_HOME` | `/opt/lean/mathlib-cache` |
 | `LEAN_WORKSPACE` | `/opt/lean/workspace` |
 | `PATH` | Includes `/opt/lean/elan/bin` and `/opt/lean/venv/bin` |
 
@@ -122,5 +129,5 @@ The `env.sh` script includes a `ulimit -s unlimited` safeguard for gVisor enviro
 
 - **`lean: command not found`** — Run `source /opt/lean/env.sh` first.
 - **`dpkg` errors during install** — The installer uses `|| true` to continue past non-fatal `.deb` issues; check `dpkg -i` output for real failures.
-- **Mathlib import errors** — Ensure `XDG_CACHE_HOME` points to `/opt/lean/mathlib-cache` (set by `env.sh`).
+- **Mathlib import errors** — The `.olean` cache is prebuilt in `workspace/.lake/packages/mathlib/.lake/build`; ensure you're running from `/opt/lean/workspace`.
 - **Python import errors** — Activate the venv: `source /opt/lean/venv/bin/activate`.

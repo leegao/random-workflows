@@ -140,6 +140,15 @@ jobs:
         # Strip .git history from downloaded Lake packages to save massive space while keeping sources & .oleans intact
         find .lake/packages -name ".git" -type d -exec rm -rf {} +
 
+        # Drop mathlib-cache — .oleans are already in workspace/.lake/packages/mathlib/.lake/build
+        # The cache dir is only needed for re-downloading, not for offline use.
+        rm -rf "${BUNDLE_ROOT}/mathlib-cache"
+
+        # Strip non-runtime files from elan toolchain (docs, tests, source) to save space
+        find "${BUNDLE_ROOT}/elan/toolchains" -type d \
+          \( -name "src" -o -name "tests" -o -name "doc" -o -name "docs" \) \
+          -exec rm -rf {} +
+
     - name: Download Python interface wheels (lean-interact & leanclient)
       run: |
         python3 -m pip download \
@@ -171,11 +180,10 @@ jobs:
           echo "[1/4] Skipping .deb installation (not root)."
         fi
 
-        # 2. Deploy Elan toolchain, Mathlib cache, and prebuilt Lake workspace
-        echo "[2/4] Copying Elan toolchain, Mathlib cache, and Lake workspace..."
+        # 2. Deploy Elan toolchain and prebuilt Lake workspace
+        echo "[2/4] Copying Elan toolchain and Lake workspace..."
         mkdir -p "${TARGET_PREFIX}"
         cp -a "${BUNDLE_DIR}/elan" "${TARGET_PREFIX}/elan"
-        cp -a "${BUNDLE_DIR}/mathlib-cache" "${TARGET_PREFIX}/mathlib-cache"
         cp -a "${BUNDLE_DIR}/workspace" "${TARGET_PREFIX}/workspace"
 
         # 3. Create offline Python virtual environment with lean-interact
@@ -188,7 +196,6 @@ jobs:
         echo "[4/4] Creating environment helper at ${TARGET_PREFIX}/env.sh..."
         cat <<ENVEOF > "${TARGET_PREFIX}/env.sh"
         export ELAN_HOME="${TARGET_PREFIX}/elan"
-        export XDG_CACHE_HOME="${TARGET_PREFIX}/mathlib-cache"
         export LEAN_WORKSPACE="${TARGET_PREFIX}/workspace"
         export PATH="${TARGET_PREFIX}/elan/bin:${TARGET_PREFIX}/venv/bin:\${PATH}"
 
@@ -203,18 +210,35 @@ jobs:
         sed -i 's/^        //' "${BUNDLE_ROOT}/install.sh"
         chmod +x "${BUNDLE_ROOT}/install.sh"
 
-    - name: Package compressed airgapped bundle
+    - name: Show bundle size tree (depth=2, raw sizes)
       run: |
-        # Use multi-threaded xz compression; note Mathlib + Elan is ~2-3GB compressed
-        tar -I 'xz -6 -T0 -v' -cf lean-mathlib-bookworm-${LEAN_VERSION}.tar.xz \
-          -C "${BUNDLE_ROOT}" debs wheels elan mathlib-cache workspace install.sh lean.md
-        ls -lh lean-mathlib-bookworm-${LEAN_VERSION}.tar.xz
+        echo "=== Raw bundle size tree (depth=2) ==="
+        echo "(Apply ~0.25-0.3x multiplier for estimated compressed size)"
+        echo
+        du -h --max-depth=2 "${BUNDLE_ROOT}" | sort -rh
+        echo
+        echo "=== Per-part breakdown ==="
+        echo "Part 1 (debs + elan + install.sh + lean.md):"
+        du -sh "${BUNDLE_ROOT}/debs" "${BUNDLE_ROOT}/elan" "${BUNDLE_ROOT}/install.sh" "${BUNDLE_ROOT}/lean.md"
+        echo
+        echo "Part 2 (workspace + wheels):"
+        du -sh "${BUNDLE_ROOT}/workspace" "${BUNDLE_ROOT}/wheels"
+        echo
+        echo "Workspace breakdown (depth=2):"
+        du -h --max-depth=2 "${BUNDLE_ROOT}/workspace" | sort -rh | head -20
 
-    - name: Split out standalone Python + REPL helper tarball
+    - name: Package compressed airgapped bundle (split for GitHub 2 GB asset limit)
       run: |
-        tar -I 'xz -6 -T0' -cf lean-python-repl-bookworm-${LEAN_VERSION}.tar.xz \
-          -C "${BUNDLE_ROOT}" wheels workspace/.lake/packages/repl lean.md
-        ls -lh lean-python-repl-bookworm-${LEAN_VERSION}.tar.xz
+        # GitHub release assets must be < 2 GB each; split into two parts.
+        # Part 1: system debs, elan toolchain, install script, docs
+        tar -I 'xz -6 -T0 -v' -cf lean-mathlib-bookworm-${LEAN_VERSION}-part1.tar.xz \
+          -C "${BUNDLE_ROOT}" debs elan install.sh lean.md
+        ls -lh lean-mathlib-bookworm-${LEAN_VERSION}-part1.tar.xz
+
+        # Part 2: prebuilt Lake workspace (Mathlib + REPL + deps) and Python wheels
+        tar -I 'xz -6 -T0 -v' -cf lean-mathlib-bookworm-${LEAN_VERSION}-part2.tar.xz \
+          -C "${BUNDLE_ROOT}" workspace wheels
+        ls -lh lean-mathlib-bookworm-${LEAN_VERSION}-part2.tar.xz
 
     - name: Upload bundle artifacts
       uses: actions/upload-artifact@v4
@@ -222,7 +246,6 @@ jobs:
         name: lean-mathlib-bookworm-${{ env.LEAN_VERSION }}
         path: |
           lean-mathlib-bookworm-*.tar.xz
-          lean-python-repl-bookworm-*.tar.xz
         retention-days: 5
 
     - name: Prepare release metadata
@@ -246,7 +269,6 @@ jobs:
         body: Automated predownloaded Debian 12 (bookworm) airgapped bundle for Lean ${{ env.LEAN_VERSION }}, Mathlib, REPL, and lean-interact.
         files: |
           lean-mathlib-bookworm-*.tar.xz
-          lean-python-repl-bookworm-*.tar.xz
         fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -276,12 +298,14 @@ jobs:
     - name: Extract bundle
       run: |
         cd /tmp/verify
-        tar -xf lean-mathlib-bookworm-*.tar.xz
-        ls -lh
+        mkdir -p /opt/lean-bundle
+        tar -xf lean-mathlib-bookworm-*-part1.tar.xz -C /opt/lean-bundle
+        tar -xf lean-mathlib-bookworm-*-part2.tar.xz -C /opt/lean-bundle
+        ls -lh /opt/lean-bundle
 
     - name: Run install.sh
       run: |
-        cd /tmp/verify/lean-mathlib-bookworm-*
+        cd /opt/lean-bundle
         ./install.sh /opt/lean
 
     - name: Verify Lean toolchain
@@ -312,14 +336,5 @@ jobs:
 
     - name: Verify lean.md is present
       run: |
-        test -f /tmp/verify/lean-mathlib-bookworm-*/lean.md
+        test -f /opt/lean-bundle/lean.md
         echo "lean.md found"
-
-    - name: Verify helper tarball
-      run: |
-        cd /tmp/verify
-        tar -xf lean-python-repl-bookworm-*.tar.xz -C /tmp/helper-test
-        test -d /tmp/helper-test/wheels
-        test -d /tmp/helper-test/workspace/.lake/packages/repl
-        test -f /tmp/helper-test/lean.md
-        echo "Helper tarball OK"
