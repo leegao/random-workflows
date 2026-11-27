@@ -38,6 +38,9 @@ jobs:
       BUNDLE_ROOT: /tmp/lean-airgapped-bundle
 
     steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
     - name: Install host container prerequisites
       run: |
         apt-get update
@@ -247,3 +250,76 @@ jobs:
         fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  verify:
+    name: Verify bundle in fresh bookworm container
+    runs-on: ubuntu-latest
+    needs: package
+    container:
+      image: debian:bookworm
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LEAN_VERSION: ${{ github.event.inputs.lean_version || 'v4.31.0' }}
+
+    steps:
+    - name: Install minimal prereqs for artifact download and extraction
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl xz-utils
+
+    - name: Download bundle artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: lean-mathlib-bookworm-${{ env.LEAN_VERSION }}
+        path: /tmp/verify
+
+    - name: Extract bundle
+      run: |
+        cd /tmp/verify
+        tar -xf lean-mathlib-bookworm-*.tar.xz
+        ls -lh
+
+    - name: Run install.sh
+      run: |
+        cd /tmp/verify/lean-mathlib-bookworm-*
+        ./install.sh /opt/lean
+
+    - name: Verify Lean toolchain
+      run: |
+        source /opt/lean/env.sh
+        lean --version
+        lake --version
+        elan --version
+
+    - name: Verify Mathlib build
+      run: |
+        source /opt/lean/env.sh
+        cd /opt/lean/workspace
+        lake build AirgappedMathlib
+
+    - name: Verify Lean REPL
+      run: |
+        source /opt/lean/env.sh
+        cd /opt/lean/workspace
+        lake build repl
+        echo '{"cmd": "import Mathlib"}' | lake exe repl
+
+    - name: Verify Python lean-interact
+      run: |
+        source /opt/lean/env.sh
+        python3 -c "import lean_interact; print('lean-interact OK')"
+        python3 -c "import leanclient; print('leanclient OK')"
+
+    - name: Verify lean.md is present
+      run: |
+        test -f /tmp/verify/lean-mathlib-bookworm-*/lean.md
+        echo "lean.md found"
+
+    - name: Verify helper tarball
+      run: |
+        cd /tmp/verify
+        tar -xf lean-python-repl-bookworm-*.tar.xz -C /tmp/helper-test
+        test -d /tmp/helper-test/wheels
+        test -d /tmp/helper-test/workspace/.lake/packages/repl
+        test -f /tmp/helper-test/lean.md
+        echo "Helper tarball OK"
