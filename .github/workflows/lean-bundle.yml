@@ -1,0 +1,249 @@
+name: Package Lean 4 & Mathlib Airgapped Bundle
+
+# Builds a self-contained Debian 12 (bookworm) bundle containing:
+# - System .deb packages (git, curl, build-essential, libgmp-dev, python3-venv, etc.)
+# - Elan + pinned Lean 4 toolchain (~/.elan)
+# - Pre-populated Mathlib workspace + precompiled .olean cache (~/.cache/mathlib & .lake)
+# - LeanInteract + Lean REPL (precompiled) + offline Python wheels
+# - Offline install.sh script tailored for an airgapped Debian 12 gVisor sandbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      lean_version:
+        description: 'Lean 4 / Mathlib tag (e.g., v4.31.0 or v4.35.0)'
+        required: true
+        default: 'v4.31.0'
+      repl_version:
+        description: 'leanprover-community/repl git tag'
+        required: true
+        default: 'v4.31.0'
+  push:
+    paths:
+      - '.github/workflows/lean-bundle.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Fetch & build Lean 4 + Mathlib airgapped bundle
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LEAN_VERSION: ${{ github.event.inputs.lean_version || 'v4.31.0' }}
+      REPL_VERSION: ${{ github.event.inputs.repl_version || 'v4.31.0' }}
+      BUNDLE_ROOT: /tmp/lean-airgapped-bundle
+
+    steps:
+    - name: Install host container prerequisites
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          ca-certificates curl git zstd tar xz-utils \
+          python3 python3-pip python3-venv python3-dev \
+          build-essential libgmp-dev pkg-config
+
+    - name: Create bundle directory layout
+      run: |
+        mkdir -p "${BUNDLE_ROOT}/debs" \
+                 "${BUNDLE_ROOT}/wheels" \
+                 "${BUNDLE_ROOT}/elan" \
+                 "${BUNDLE_ROOT}/mathlib-cache" \
+                 "${BUNDLE_ROOT}/workspace"
+
+    - name: Copy documentation into bundle
+      run: |
+        cp "${GITHUB_WORKSPACE}/lean.md" "${BUNDLE_ROOT}/lean.md"
+
+    - name: Download Debian 12 runtime .deb packages for offline sandbox
+      run: |
+        # Use an empty dpkg status file so apt-get downloads all packages and
+        # transitive dependencies even if they are already installed in the container.
+        apt-get update
+        touch /tmp/empty-dpkg-status
+        apt-get install --download-only -y \
+          -o Dir::State::status=/tmp/empty-dpkg-status \
+          -o Dir::Cache::Archives="${BUNDLE_ROOT}/debs" \
+          git ca-certificates libgmp-dev build-essential \
+          python3 python3-venv python3-pip zstd xz-utils
+        rm -f /tmp/empty-dpkg-status \
+              "${BUNDLE_ROOT}/debs/lock"
+        rm -rf "${BUNDLE_ROOT}/debs/partial"
+
+    - name: Install Elan and pinned Lean 4 toolchain
+      run: |
+        export ELAN_HOME="${BUNDLE_ROOT}/elan"
+        export PATH="${ELAN_HOME}/bin:${PATH}"
+
+        # Non-interactive Elan installation without modifying shell rc files
+        curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --no-modify-path --default-toolchain "leanprover/lean4:${LEAN_VERSION}"
+
+        elan --version
+        lean --version
+        lake --version
+
+    - name: Initialize Mathlib + REPL workspace and fetch precompiled .oleans
+      run: |
+        export ELAN_HOME="${BUNDLE_ROOT}/elan"
+        export XDG_CACHE_HOME="${BUNDLE_ROOT}/mathlib-cache"
+        export PATH="${ELAN_HOME}/bin:${PATH}"
+
+        cd "${BUNDLE_ROOT}/workspace"
+        git init
+        git config user.email "ci@example.com"
+        git config user.name "CI Builder"
+
+        echo "leanprover/lean4:${LEAN_VERSION}" > lean-toolchain
+
+        cat <<EOF > lakefile.toml
+        name = "airgapped_mathlib"
+        version = "0.1.0"
+        defaultTargets = ["AirgappedMathlib"]
+
+        [[lean_lib]]
+        name = "AirgappedMathlib"
+
+        [[require]]
+        name = "mathlib"
+        scope = "leanprover-community"
+        rev = "${LEAN_VERSION}"
+
+        [[require]]
+        name = "repl"
+        git = "https://github.com/leanprover-community/repl.git"
+        rev = "${REPL_VERSION}"
+        EOF
+
+        cat <<EOF > AirgappedMathlib.lean
+        import Mathlib.Data.Nat.Prime.Basic
+        import Mathlib.Tactic
+
+        theorem sanity_check (n : Nat) : n + 0 = n := by simp
+        EOF
+
+        # Resolve transitive Lake dependencies (batteries, aesop, proofwidgets, Qq, importGraph, cli, etc.)
+        lake update
+
+        # Download precompiled Mathlib .olean artifacts (~1.5 - 2.5 GB)
+        lake exe cache get
+
+        # Build the REPL binary and sanity-check target so everything is warm and precompiled
+        lake build repl
+        lake build AirgappedMathlib
+
+        # Strip .git history from downloaded Lake packages to save massive space while keeping sources & .oleans intact
+        find .lake/packages -name ".git" -type d -exec rm -rf {} +
+
+    - name: Download Python interface wheels (lean-interact & leanclient)
+      run: |
+        python3 -m pip download \
+          --dest "${BUNDLE_ROOT}/wheels" \
+          --only-binary=:all: \
+          --platform manylinux2014_x86_64 \
+          --python-version 3.11 \
+          pip setuptools wheel lean-interact leanclient || \
+        python3 -m pip download \
+          --dest "${BUNDLE_ROOT}/wheels" \
+          pip setuptools wheel lean-interact leanclient
+
+    - name: Generate airgapped install.sh and gVisor wrapper
+      run: |
+        cat <<'EOF' > "${BUNDLE_ROOT}/install.sh"
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        TARGET_PREFIX="${1:-/opt/lean}"
+
+        echo "=== Installing Airgapped Lean 4 + Mathlib Bundle into ${TARGET_PREFIX} ==="
+
+        # 1. Install offline .deb dependencies if running as root and dpkg is available
+        if [ "$(id -u)" -eq 0 ] && [ -d "${BUNDLE_DIR}/debs" ]; then
+          echo "[1/4] Installing offline Debian packages..."
+          dpkg -i "${BUNDLE_DIR}/debs/"*.deb || true
+        else
+          echo "[1/4] Skipping .deb installation (not root)."
+        fi
+
+        # 2. Deploy Elan toolchain, Mathlib cache, and prebuilt Lake workspace
+        echo "[2/4] Copying Elan toolchain, Mathlib cache, and Lake workspace..."
+        mkdir -p "${TARGET_PREFIX}"
+        cp -a "${BUNDLE_DIR}/elan" "${TARGET_PREFIX}/elan"
+        cp -a "${BUNDLE_DIR}/mathlib-cache" "${TARGET_PREFIX}/mathlib-cache"
+        cp -a "${BUNDLE_DIR}/workspace" "${TARGET_PREFIX}/workspace"
+
+        # 3. Create offline Python virtual environment with lean-interact
+        echo "[3/4] Installing Python interfaces (lean-interact, leanclient) offline..."
+        python3 -m venv "${TARGET_PREFIX}/venv"
+        "${TARGET_PREFIX}/venv/bin/pip" install --no-index --find-links="${BUNDLE_DIR}/wheels" \
+          lean-interact leanclient
+
+        # 4. Generate environment activation & gVisor-safe wrapper script
+        echo "[4/4] Creating environment helper at ${TARGET_PREFIX}/env.sh..."
+        cat <<ENVEOF > "${TARGET_PREFIX}/env.sh"
+        export ELAN_HOME="${TARGET_PREFIX}/elan"
+        export XDG_CACHE_HOME="${TARGET_PREFIX}/mathlib-cache"
+        export LEAN_WORKSPACE="${TARGET_PREFIX}/workspace"
+        export PATH="${TARGET_PREFIX}/elan/bin:${TARGET_PREFIX}/venv/bin:\${PATH}"
+
+        # gVisor stack/thread safeguard: ensure large stack ulimit if permitted
+        ulimit -s unlimited 2>/dev/null || true
+        ENVEOF
+
+        chmod +x "${TARGET_PREFIX}/env.sh"
+        echo "=== Done! Run: source ${TARGET_PREFIX}/env.sh ==="
+        EOF
+        # Strip the 8-space YAML indentation so the shebang starts at byte 0
+        sed -i 's/^        //' "${BUNDLE_ROOT}/install.sh"
+        chmod +x "${BUNDLE_ROOT}/install.sh"
+
+    - name: Package compressed airgapped bundle
+      run: |
+        # Use multi-threaded xz compression; note Mathlib + Elan is ~2-3GB compressed
+        tar -I 'xz -6 -T0 -v' -cf lean-mathlib-bookworm-${LEAN_VERSION}.tar.xz \
+          -C "${BUNDLE_ROOT}" debs wheels elan mathlib-cache workspace install.sh lean.md
+        ls -lh lean-mathlib-bookworm-${LEAN_VERSION}.tar.xz
+
+    - name: Split out standalone Python + REPL helper tarball
+      run: |
+        tar -I 'xz -6 -T0' -cf lean-python-repl-bookworm-${LEAN_VERSION}.tar.xz \
+          -C "${BUNDLE_ROOT}" wheels workspace/.lake/packages/repl lean.md
+        ls -lh lean-python-repl-bookworm-${LEAN_VERSION}.tar.xz
+
+    - name: Upload bundle artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: lean-mathlib-bookworm-${{ env.LEAN_VERSION }}
+        path: |
+          lean-mathlib-bookworm-*.tar.xz
+          lean-python-repl-bookworm-*.tar.xz
+        retention-days: 5
+
+    - name: Prepare release metadata
+      if: github.event_name == 'push'
+      id: rel
+      run: |
+        DATE="$(date -u +%Y%m%d)"
+        COMMIT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+        EPOCH="$(date -u +%s)"
+        TAG="lean-bookworm-${LEAN_VERSION}-${DATE}-${COMMIT}-${EPOCH}"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "date=$DATE" >> "$GITHUB_OUTPUT"
+        echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+    - name: Create GitHub release
+      if: github.event_name == 'push'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.rel.outputs.tag }}
+        name: Lean 4 (${{ env.LEAN_VERSION }}) Bookworm Bundle ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
+        body: Automated predownloaded Debian 12 (bookworm) airgapped bundle for Lean ${{ env.LEAN_VERSION }}, Mathlib, REPL, and lean-interact.
+        files: |
+          lean-mathlib-bookworm-*.tar.xz
+          lean-python-repl-bookworm-*.tar.xz
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
