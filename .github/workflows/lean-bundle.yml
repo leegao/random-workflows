@@ -155,12 +155,14 @@ jobs:
             find "$pkg" -name "*.trace" -delete
           fi
         done
-        # Strip mathlib non-runtime directories (tests, scripts, archive, docs, .github)
+        # Strip mathlib non-runtime directories (tests, scripts, archive, docs, .github, bin, ir)
         rm -rf .lake/packages/mathlib/MathlibTest \
                .lake/packages/mathlib/scripts \
                .lake/packages/mathlib/Archive \
                .lake/packages/mathlib/docs \
-               .lake/packages/mathlib/.github
+               .lake/packages/mathlib/.github \
+               .lake/packages/mathlib/.lake/build/bin \
+               .lake/packages/mathlib/.lake/build/ir
 
         # Drop mathlib-cache — .oleans are already in workspace/.lake/packages/mathlib/.lake/build
         # The cache dir is only needed for re-downloading, not for offline use.
@@ -259,6 +261,9 @@ jobs:
         echo
         echo "=== Elan lib/ breakdown (depth=1) ==="
         du -h --max-depth=1 "${BUNDLE_ROOT}/elan/toolchains/"*/lib | sort -rh | head -20
+        echo
+        echo "=== Elan lib/lean breakdown (depth=1) ==="
+        du -h --max-depth=1 "${BUNDLE_ROOT}/elan/toolchains/"*/lib/lean | sort -rh | head -20
         echo
         echo "=== Mathlib .lake/build breakdown (depth=1) ==="
         du -h --max-depth=1 "${BUNDLE_ROOT}/workspace/.lake/packages/mathlib/.lake/build" | sort -rh | head -20
