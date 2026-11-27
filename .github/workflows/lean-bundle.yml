@@ -140,14 +140,32 @@ jobs:
         # Strip .git history from downloaded Lake packages to save massive space while keeping sources & .oleans intact
         find .lake/packages -name ".git" -type d -exec rm -rf {} +
 
+        # Strip non-runtime files from Lake packages to save space:
+        # - .c source files (generated from .lean, not needed at runtime)
+        # - test directories
+        # - .olean files in non-essential packages (only mathlib + repl need precompiled .oleans)
+        find .lake/packages -name "*.c" -delete
+        find .lake/packages -type d \( -name "tests" -o -name "test" -o -name "Test" \) -exec rm -rf {} +
+        for pkg in .lake/packages/*/; do
+          pkg_name="$(basename "$pkg")"
+          if [ "$pkg_name" != "mathlib" ] && [ "$pkg_name" != "repl" ]; then
+            find "$pkg" -name "*.olean" -delete
+            find "$pkg" -name "*.ilean" -delete
+            find "$pkg" -name "*.trace" -delete
+          fi
+        done
+
         # Drop mathlib-cache — .oleans are already in workspace/.lake/packages/mathlib/.lake/build
         # The cache dir is only needed for re-downloading, not for offline use.
         rm -rf "${BUNDLE_ROOT}/mathlib-cache"
 
-        # Strip non-runtime files from elan toolchain (docs, tests, source) to save space
+        # Strip non-runtime files from elan toolchain (docs, tests, source, archives) to save space
         find "${BUNDLE_ROOT}/elan/toolchains" -type d \
           \( -name "src" -o -name "tests" -o -name "doc" -o -name "docs" \) \
           -exec rm -rf {} +
+        find "${BUNDLE_ROOT}/elan/toolchains" \
+          \( -name "*.tar.gz" -o -name "*.tar.xz" -o -name "*.zip" \) \
+          -delete
 
     - name: Download Python interface wheels (lean-interact & leanclient)
       run: |
@@ -224,8 +242,11 @@ jobs:
         echo "Part 2 (workspace + wheels):"
         du -sh "${BUNDLE_ROOT}/workspace" "${BUNDLE_ROOT}/wheels"
         echo
-        echo "Workspace breakdown (depth=2):"
-        du -h --max-depth=2 "${BUNDLE_ROOT}/workspace" | sort -rh | head -20
+        echo "=== Workspace .lake/packages breakdown (depth=2) ==="
+        du -h --max-depth=2 "${BUNDLE_ROOT}/workspace/.lake/packages" | sort -rh | head -30
+        echo
+        echo "=== Elan toolchain breakdown (depth=2) ==="
+        du -h --max-depth=2 "${BUNDLE_ROOT}/elan/toolchains" | sort -rh | head -20
 
     - name: Package compressed airgapped bundle (split for GitHub 2 GB asset limit)
       run: |
